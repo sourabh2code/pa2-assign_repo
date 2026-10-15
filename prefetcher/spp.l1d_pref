@@ -1,24 +1,390 @@
 #include "cache.h"
 
+#include <cstdint>
+#include <iostream>
 
-void CACHE::l1d_prefetcher_initialize() 
-{
-    std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
-    std::cout << "------------------------------------------------" << std::endl;
+namespace {
+constexpr uint32_t IP_TABLE_SIZE = 64;
+constexpr uint32_t SIGNATURE_TABLE_SIZE = 1024;
+constexpr uint32_t TRACKER_SIZE = 4096;
+constexpr uint32_t PAGE_BITS = 12;
+constexpr uint32_t LINE_BITS = LOG2_BLOCK_SIZE;
+
+constexpr uint8_t MAX_CONFIDENCE = 3;
+constexpr uint8_t UNIFORM_THRESHOLD = 2;
+constexpr uint8_t SIGNATURE_THRESHOLD = 2;
+constexpr uint32_t MIN_DEGREE = 4;
+constexpr uint32_t MAX_DEGREE = 4;
+constexpr uint64_t ADAPT_OUTCOMES = 128;
+constexpr double ACCURACY_HIGH = 0.60;
+constexpr double ACCURACY_LOW = 0.25;
+
+
+constexpr uint32_t HISTORY_LENGTH = 3;
+
+enum PatternMode : uint8_t { UNKNOWN = 0, UNIFORM = 1, NON_UNIFORM = 2 };
+
+struct IPEntry {
+    uint64_t ip = 0;
+    uint64_t last_line = 0;
+    int64_t history[HISTORY_LENGTH] = {0, 0, 0};
+    int64_t last_stride = 0;
+    uint8_t history_count = 0;
+    uint8_t uniform_confidence = 0;
+    uint8_t mode = UNKNOWN;
+    uint32_t lru = 0;
+    bool valid = false;
+};
+
+struct SignatureEntry {
+    uint64_t signature = 0;
+    int64_t next_stride = 0;
+    uint8_t confidence = 0;
+    bool valid = false;
+};
+
+struct TrackerEntry {
+    uint64_t line = 0;
+    bool valid = false;
+};
+
+IPEntry ip_table[IP_TABLE_SIZE];
+SignatureEntry signature_table[SIGNATURE_TABLE_SIZE];
+TrackerEntry tracker[TRACKER_SIZE];
+uint32_t tracker_cursor = 0;
+uint32_t current_degree = 2;
+
+uint64_t total_issued = 0;
+uint64_t total_useful = 0;
+uint64_t total_useless_evicted = 0;
+uint64_t signature_lookups = 0;
+uint64_t signature_hits = 0;
+uint64_t signature_replacements = 0;
+uint64_t uniform_predictions = 0;
+uint64_t nonuniform_predictions = 0;
+
+uint64_t window_useful = 0;
+uint64_t window_useless = 0;
+
+uint64_t make_signature(const int64_t history[HISTORY_LENGTH]) {
+    uint64_t h = 1469598103934665603ULL;
+    for (uint32_t i = 0; i < HISTORY_LENGTH; ++i) {
+        h ^= static_cast<uint64_t>(history[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   
+int find_ip(uint64_t ip) {
+    for (uint32_t i = 0; i < IP_TABLE_SIZE; ++i)
+        if (ip_table[i].valid && ip_table[i].ip == ip)
+            return static_cast<int>(i);
+    return -1;
 }
 
-void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
-{
-	return; //metadata_in;
+void touch_ip(uint32_t index) {
+    for (uint32_t i = 0; i < IP_TABLE_SIZE; ++i) {
+        if (i == index || !ip_table[i].valid) continue;
+        if (ip_table[i].lru < IP_TABLE_SIZE - 1) ++ip_table[i].lru;
+    }
+    ip_table[index].lru = 0;
 }
 
-void CACHE::l1d_prefetcher_final_stats()
-{
+uint32_t allocate_ip(uint64_t ip, uint64_t line) {
+    uint32_t victim = IP_TABLE_SIZE;
+    for (uint32_t i = 0; i < IP_TABLE_SIZE; ++i) {
+        if (!ip_table[i].valid) { victim = i; break; }
+    }
+    if (victim == IP_TABLE_SIZE) {
+        victim = 0;
+        for (uint32_t i = 1; i < IP_TABLE_SIZE; ++i)
+            if (ip_table[i].lru > ip_table[victim].lru) victim = i;
+    }
+    ip_table[victim] = IPEntry{};
+    ip_table[victim].ip = ip;
+    ip_table[victim].last_line = line;
+    ip_table[victim].valid = true;
+    touch_ip(victim);
+    return victim;
+}
 
+void push_stride(int64_t history[HISTORY_LENGTH], uint8_t& count,
+                 int64_t stride) {
+    if (count < HISTORY_LENGTH) {
+        history[count++] = stride;
+    } else {
+        for (uint32_t i = 0; i + 1 < HISTORY_LENGTH; ++i)
+            history[i] = history[i + 1];
+        history[HISTORY_LENGTH - 1] = stride;
+    }
+}
+
+void train_signature(uint64_t signature, int64_t observed_stride) {
+    SignatureEntry& e = signature_table[signature % SIGNATURE_TABLE_SIZE];
+    if (!e.valid || e.signature != signature) {
+        if (e.valid) ++signature_replacements;
+        e = SignatureEntry{};
+        e.signature = signature;
+        e.next_stride = observed_stride;
+        e.confidence = 1;
+        e.valid = true;
+        return;
+    }
+
+    if (e.next_stride == observed_stride) {
+        if (e.confidence < MAX_CONFIDENCE) ++e.confidence;
+    } else if (e.confidence > 1) {
+        --e.confidence;
+    } else {
+        
+        e.next_stride = observed_stride;
+        e.confidence = 1;
+    }
+}
+
+bool lookup_signature(uint64_t signature, int64_t& predicted_stride) {
+    ++signature_lookups;
+    const SignatureEntry& e = signature_table[signature % SIGNATURE_TABLE_SIZE];
+    if (e.valid && e.signature == signature &&
+        e.confidence >= SIGNATURE_THRESHOLD && e.next_stride != 0) {
+        ++signature_hits;
+        predicted_stride = e.next_stride;
+        return true;
+    }
+    return false;
+}
+
+void track_prefetch(uint64_t line) {
+    
+    for (uint32_t i = 0; i < TRACKER_SIZE; ++i)
+        if (tracker[i].valid && tracker[i].line == line) return;
+
+    tracker[tracker_cursor].line = line;
+    tracker[tracker_cursor].valid = true;
+    tracker_cursor = (tracker_cursor + 1) % TRACKER_SIZE;
+}
+
+void record_demand_use(uint64_t line) {
+    for (uint32_t i = 0; i < TRACKER_SIZE; ++i) {
+        if (tracker[i].valid && tracker[i].line == line) {
+            tracker[i].valid = false;
+            ++total_useful;
+            ++window_useful;
+            return;
+        }
+    }
+}
+
+void record_eviction(uint64_t evicted_line) {
+    for (uint32_t i = 0; i < TRACKER_SIZE; ++i) {
+        if (tracker[i].valid && tracker[i].line == evicted_line) {
+            tracker[i].valid = false;
+            ++total_useless_evicted;
+            ++window_useless;
+            return;
+        }
+    }
+}
+
+bool compute_target_line(uint64_t current_line, int64_t stride,
+                         uint32_t distance, uint64_t& target_line) {
+    const int64_t delta = stride * static_cast<int64_t>(distance);
+    if (delta < 0) {
+        const uint64_t magnitude = static_cast<uint64_t>(-(delta + 1)) + 1;
+        if (magnitude > current_line) return false;
+        target_line = current_line - magnitude;
+    } else {
+        const uint64_t magnitude = static_cast<uint64_t>(delta);
+        if (magnitude > UINT64_MAX - current_line) return false;
+        target_line = current_line + magnitude;
+    }
+
+    constexpr uint64_t LINES_PER_PAGE = uint64_t{1} << (PAGE_BITS - LINE_BITS);
+    return current_line / LINES_PER_PAGE == target_line / LINES_PER_PAGE;
+}
+
+void adapt_degree() {
+    const uint64_t outcomes = window_useful + window_useless;
+    if (outcomes < ADAPT_OUTCOMES) return;
+
+    const double accuracy = static_cast<double>(window_useful) /
+                            static_cast<double>(outcomes);
+    if (accuracy >= ACCURACY_HIGH && current_degree < MAX_DEGREE) {
+        ++current_degree;
+    } else if (accuracy < ACCURACY_LOW && current_degree > MIN_DEGREE) {
+        --current_degree;
+    }
+    window_useful = 0;
+    window_useless = 0;
+}
+}
+
+void CACHE::l1d_prefetcher_initialize() {
+    for (auto& e : ip_table) e = IPEntry{};
+    for (auto& e : signature_table) e = SignatureEntry{};
+    for (auto& e : tracker) e = TrackerEntry{};
+    tracker_cursor = 0;
+    current_degree = 2;
+    total_issued = total_useful = total_useless_evicted = 0;
+    signature_lookups = signature_hits = signature_replacements = 0;
+    uniform_predictions = nonuniform_predictions = 0;
+    window_useful = window_useless = 0;
+
+    std::cout << "----------------------------------------\n"
+              << "IP dual-pattern SPP prefetcher\n"
+              << "Uniform priority + stride-signature fallback\n"
+              << "Initial degree: " << current_degree
+              << ", range: " << MIN_DEGREE << "-" << MAX_DEGREE << '\n'
+              << "----------------------------------------\n";
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip,
+                                   uint8_t cache_hit, uint8_t type,
+                                   uint8_t critical_ip_flag) {
+    (void)cache_hit;
+    (void)critical_ip_flag;
+    if (type == WRITEBACK) return;
+
+    const uint64_t line = addr >> LINE_BITS;
+    record_demand_use(line);
+
+    int index = find_ip(ip);
+    if (index < 0) {
+        allocate_ip(ip, line);
+        return;
+    }
+
+    IPEntry& e = ip_table[index];
+    const int64_t stride = line >= e.last_line
+        ? static_cast<int64_t>(line - e.last_line)
+        : -static_cast<int64_t>(e.last_line - line);
+
+    if (stride == 0) {
+        touch_ip(static_cast<uint32_t>(index));
+        return;
+    }
+
+    if (e.history_count == HISTORY_LENGTH)
+        train_signature(make_signature(e.history), stride);
+
+    if (e.last_stride != 0 && stride == e.last_stride) {
+        if (e.uniform_confidence < MAX_CONFIDENCE) ++e.uniform_confidence;
+    } else {
+        e.uniform_confidence = 0;
+    }
+
+    e.last_line = line;
+    e.last_stride = stride;
+    push_stride(e.history, e.history_count, stride);
+    touch_ip(static_cast<uint32_t>(index));
+
+    if (e.history_count < HISTORY_LENGTH) return;
+
+    int64_t first_stride = 0;
+    bool use_uniform = e.uniform_confidence >= UNIFORM_THRESHOLD &&
+                       e.last_stride != 0;
+    bool use_signature = false;
+
+    if (use_uniform) {
+        first_stride = e.last_stride;
+        e.mode = UNIFORM;
+        ++uniform_predictions;
+    } else {
+        use_signature = lookup_signature(make_signature(e.history), first_stride);
+        if (!use_signature) {
+            e.mode = UNKNOWN;
+            adapt_degree();
+            return;
+        }
+        e.mode = NON_UNIFORM;
+        ++nonuniform_predictions;
+    }
+
+    int64_t future_history[HISTORY_LENGTH] = {
+        e.history[0], e.history[1], e.history[2]
+    };
+    uint8_t future_count = e.history_count;
+    uint64_t predicted_line = line;
+
+    for (uint32_t distance = 1; distance <= current_degree; ++distance) {
+        int64_t stride_to_issue = first_stride;
+        if (distance > 1) {
+            if (use_uniform) {
+                stride_to_issue = e.last_stride;
+            } else {
+                int64_t next_stride = 0;
+                if (!lookup_signature(make_signature(future_history), next_stride))
+                    break;
+                stride_to_issue = next_stride;
+            }
+        }
+
+        uint64_t target_line = 0;
+
+        if (distance == 1) {
+            if (!compute_target_line(line, stride_to_issue, 1, target_line))
+                break;
+        } else {
+            if (stride_to_issue < 0) {
+                const uint64_t magnitude =
+                    static_cast<uint64_t>(-(stride_to_issue + 1)) + 1;
+                if (magnitude > predicted_line) break;
+                target_line = predicted_line - magnitude;
+            } else {
+                const uint64_t magnitude = static_cast<uint64_t>(stride_to_issue);
+                if (magnitude > UINT64_MAX - predicted_line) break;
+                target_line = predicted_line + magnitude;
+            }
+            constexpr uint64_t LINES_PER_PAGE =
+                uint64_t{1} << (PAGE_BITS - LINE_BITS);
+            if (target_line / LINES_PER_PAGE != line / LINES_PER_PAGE) break;
+        }
+
+        if (target_line == line) break;
+        const uint64_t target_addr = target_line << LINE_BITS;
+        if (MSHR.occupancy < (MSHR.SIZE >> 1))
+            prefetch_line(ip, addr, target_addr, FILL_L1, 0);
+        else
+            prefetch_line(ip, addr, target_addr, FILL_L2, 0);
+
+        track_prefetch(target_line);
+        ++total_issued;
+        predicted_line = target_line;
+
+        if (!use_uniform)
+            push_stride(future_history, future_count, stride_to_issue);
+    }
+
+    adapt_degree();
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr,
+                                      uint32_t set, uint32_t way,
+                                      uint8_t prefetch, uint64_t v_evicted_addr,
+                                      uint64_t evicted_addr, uint32_t metadata_in) {
+    (void)v_addr; (void)addr; (void)set; (void)way; (void)prefetch;
+    (void)v_evicted_addr; (void)metadata_in;
+    if (evicted_addr != 0)
+        record_eviction(evicted_addr >> LINE_BITS);
+}
+
+void CACHE::l1d_prefetcher_final_stats() {
+    const double outcomes = static_cast<double>(total_useful + total_useless_evicted);
+    const double tracked_accuracy = outcomes == 0.0 ? 0.0 :
+        100.0 * static_cast<double>(total_useful) / outcomes;
+    const double signature_hit_rate = signature_lookups == 0 ? 0.0 :
+        100.0 * static_cast<double>(signature_hits) / signature_lookups;
+
+    std::cout << "IP dual-pattern SPP final stats\n"
+              << "Current degree: " << current_degree << '\n'
+              << "Prefetches issued (software tracker): " << total_issued << '\n'
+              << "Useful tracked prefetches: " << total_useful << '\n'
+              << "Tracked prefetches evicted unused: " << total_useless_evicted << '\n'
+              << "Tracked outcome accuracy (approximate): " << tracked_accuracy << "%\n"
+              << "Uniform predictions: " << uniform_predictions << '\n'
+              << "Non-uniform signature predictions: " << nonuniform_predictions << '\n'
+              << "Signature lookups: " << signature_lookups << '\n'
+              << "Signature hits: " << signature_hits << '\n'
+              << "Signature hit rate: " << signature_hit_rate << "%\n"
+              << "Signature table replacements: " << signature_replacements << '\n';
 }
