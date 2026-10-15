@@ -1,3 +1,5 @@
+#include "cache.h"
+
 #define maxRRPV 3
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 bool     l2_is_instr[L2C_SET][L2C_WAY];   // 1 bit per line: does it hold instructions?
