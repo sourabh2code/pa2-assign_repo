@@ -1,0 +1,124 @@
+#include "cache.h"
+  
+//    LEADER sets (NUM_LEADER_SETS of the L2C_SET sets) ALWAYS run plain RRIP.
+//    We count instruction / non-instruction accesses and misses ONLY in these sets.
+//    Every EPOCH_EVENTS leader events we compute
+//        score = (instr_accesses + instr_misses) / (total_accesses + total_misses)
+//    and compare it with THRESHOLD. score > THRESHOLD  -> instructions matter in this
+//    phase -> FOLLOWER sets use I-RRIP; otherwise followers use plain RRIP.
+//    Counters are then cleared so the decision tracks program phases.
+
+
+#define maxRRPV 3
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_instr[L2C_SET][L2C_WAY];   // same as IRRIP
+
+
+#define INSTR_INSERT_RRPV 2               // instruction fill RRPV
+#define DATA_INSERT_RRPV  (maxRRPV-1)     // data fill RRPV (SRRIP)
+#define INSTR_HIT_RRPV    0               // instruction hit -> fully protected
+#define DATA_HIT_STEP     1               // data hit lowers RRPV by 1 (gentle)
+
+// Set-dueling tunables
+#define NUM_LEADER_SETS   32                          // 32 / 1024 sets = ~3% of the cache
+#define LEADER_STRIDE     (L2C_SET / NUM_LEADER_SETS) // one leader set every 32 sets
+#define EPOCH_EVENTS      2048                        
+#define THRESHOLD_PM      250                         // threshold x1000 (250 = 0.25). Sweep: 380 430
+
+// Dueling state 
+bool     l2_use_irrip = true;             // current decision for follower sets
+uint64_t ld_instr_acc = 0, ld_instr_miss = 0;   // leader-set statistics, instruction lines
+uint64_t ld_data_acc  = 0, ld_data_miss  = 0;   // leader-set statistics, non-instruction lines
+uint64_t ld_events = 0;
+// stats printed at the end (for the report)
+uint64_t st_epochs = 0, st_epochs_irrip = 0, st_switches = 0;
+
+static inline bool is_leader_set(uint32_t set) { return (set % LEADER_STRIDE) == 0; }
+
+// A set runs I-RRIP only if it is a follower AND the current decision says "I-RRIP".
+static inline bool set_runs_irrip(uint32_t set) { return !is_leader_set(set) && l2_use_irrip; }
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (leaders=" << NUM_LEADER_SETS
+         << ", threshold=" << THRESHOLD_PM << "/1000, epoch=" << EPOCH_EVENTS << ")" << endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = false;
+        }
+}
+
+// Victim selection.
+//  RRIP mode  : first line at maxRRPV, else age everyone (identical to rrip.l2c_repl).
+//  I-RRIP mode: same as task 2A
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool irrip = set_runs_irrip(set);
+    while (1) {
+        int instr_candidate = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!irrip || !l2_is_instr[set][i]) return i;
+                if (instr_candidate < 0) instr_candidate = i;
+            }
+        }
+        if (instr_candidate >= 0) return instr_candidate;
+        for (int i = 0; i < L2C_WAY; i++) l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+// Called on every hit (promotion) and every fill (insertion).
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    //Leader sets: collect statistics
+    if (is_leader_set(set) && type != WRITEBACK) {
+        if (isInstruction) { ld_instr_acc++; if (!hit) ld_instr_miss++; }
+        else               { ld_data_acc++;  if (!hit) ld_data_miss++;  }
+        ld_events++;
+
+        // End of epoch: take the dueling decision, then clear the counters 
+        if (ld_events >= EPOCH_EVENTS) {
+            uint64_t num = ld_instr_acc + ld_instr_miss;
+            uint64_t den = ld_instr_acc + ld_instr_miss + ld_data_acc + ld_data_miss;
+            bool new_mode = (den > 0) && (num * 1000 > (uint64_t)THRESHOLD_PM * den);
+            if (new_mode != l2_use_irrip) st_switches++;
+            l2_use_irrip = new_mode;
+            st_epochs++;
+            if (l2_use_irrip) st_epochs_irrip++;
+            ld_instr_acc = ld_instr_miss = ld_data_acc = ld_data_miss = ld_events = 0;
+        }
+    }
+
+    // Replacement-state update 
+    if (!set_runs_irrip(set)) {
+        // plain RRIP (leader sets, or followers when the decision is RRIP)
+        l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
+        l2_is_instr[set][way] = !hit ? isInstruction : (l2_is_instr[set][way] || isInstruction);
+        return;
+    }
+    // I-RRIP (Task 2A behaviour)
+    if (hit) {
+        if (isInstruction) {
+            l2_is_instr[set][way] = true;
+            l2_rrpv[set][way] = INSTR_HIT_RRPV;
+        } else {
+            l2_rrpv[set][way] = (l2_rrpv[set][way] > DATA_HIT_STEP) ? l2_rrpv[set][way] - DATA_HIT_STEP : 0;
+        }
+    } else {
+        l2_is_instr[set][way] = isInstruction;
+        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "[DYN-IRRIP] epochs: " << st_epochs
+         << "  epochs in I-RRIP mode: " << st_epochs_irrip
+         << "  mode switches: " << st_switches
+         << "  final mode: " << (l2_use_irrip ? "I-RRIP" : "RRIP") << endl;
+}
