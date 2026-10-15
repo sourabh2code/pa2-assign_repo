@@ -1,0 +1,122 @@
+#include "cache.h"
+
+#define maxRRPV 3
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+bool     l2_is_instr[L2C_SET][L2C_WAY];
+
+#define INSTR_INSERT_RRPV 2
+#define DATA_INSERT_RRPV  (maxRRPV-1)
+#define INSTR_HIT_RRPV    0
+#define DATA_HIT_STEP     1
+
+#define NUM_LEADER_SETS   32
+#define LEADER_STRIDE     (L2C_SET / NUM_LEADER_SETS)
+#define EPOCH_EVENTS      2048
+#define THRESHOLD_PM      250
+
+#define PF_AWARE          1
+#define PF_INSERT_RRPV    maxRRPV
+uint64_t st_pf_fills = 0, st_pf_hits_ignored = 0;
+
+bool     l2_use_irrip = true;
+uint64_t ld_instr_acc = 0, ld_instr_miss = 0;
+uint64_t ld_data_acc  = 0, ld_data_miss  = 0;
+uint64_t ld_events = 0;
+uint64_t st_epochs = 0, st_epochs_irrip = 0, st_switches = 0;
+
+static inline bool is_leader_set(uint32_t set) { return (set % LEADER_STRIDE) == 0; }
+
+static inline bool set_runs_irrip(uint32_t set) { return !is_leader_set(set) && l2_use_irrip; }
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (leaders=" << NUM_LEADER_SETS
+         << ", threshold=" << THRESHOLD_PM << "/1000, epoch=" << EPOCH_EVENTS << ")" << endl;
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+            l2_is_instr[i][j] = false;
+        }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool irrip = set_runs_irrip(set);
+    while (1) {
+        int instr_candidate = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] == maxRRPV) {
+                if (!irrip || !l2_is_instr[set][i]) return i;
+                if (instr_candidate < 0) instr_candidate = i;
+            }
+        }
+        if (instr_candidate >= 0) return instr_candidate;
+        for (int i = 0; i < L2C_WAY; i++) l2_rrpv[set][i]++;
+    }
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    bool is_pf = PF_AWARE && (type == PREFETCH);
+
+    if (is_leader_set(set) && type != WRITEBACK && !is_pf) {
+        if (isInstruction) { ld_instr_acc++; if (!hit) ld_instr_miss++; }
+        else               { ld_data_acc++;  if (!hit) ld_data_miss++;  }
+        ld_events++;
+
+        if (ld_events >= EPOCH_EVENTS) {
+            uint64_t num = ld_instr_acc + ld_instr_miss;
+            uint64_t den = ld_instr_acc + ld_instr_miss + ld_data_acc + ld_data_miss;
+            bool new_mode = (den > 0) && (num * 1000 > (uint64_t)THRESHOLD_PM * den);
+            if (new_mode != l2_use_irrip) st_switches++;
+            l2_use_irrip = new_mode;
+            st_epochs++;
+            if (l2_use_irrip) st_epochs_irrip++;
+            ld_instr_acc = ld_instr_miss = ld_data_acc = ld_data_miss = ld_events = 0;
+        }
+    }
+
+    if (is_pf) {
+        if (hit) {
+            st_pf_hits_ignored++;
+        } else {
+            st_pf_fills++;
+            l2_rrpv[set][way] = PF_INSERT_RRPV;
+            l2_is_instr[set][way] = isInstruction;
+        }
+        return;
+    }
+
+    if (!set_runs_irrip(set)) {
+        l2_rrpv[set][way] = hit ? 0 : maxRRPV - 1;
+        l2_is_instr[set][way] = !hit ? isInstruction : (l2_is_instr[set][way] || isInstruction);
+        return;
+    }
+
+    if (hit) {
+        if (isInstruction) {
+            l2_is_instr[set][way] = true;
+            l2_rrpv[set][way] = INSTR_HIT_RRPV;
+        } else {
+            l2_rrpv[set][way] = (l2_rrpv[set][way] > DATA_HIT_STEP) ? l2_rrpv[set][way] - DATA_HIT_STEP : 0;
+        }
+    } else {
+        l2_is_instr[set][way] = isInstruction;
+        l2_rrpv[set][way] = isInstruction ? INSTR_INSERT_RRPV : DATA_INSERT_RRPV;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "[DYN-IRRIP] epochs: " << st_epochs
+         << "  epochs in I-RRIP mode: " << st_epochs_irrip
+         << "  mode switches: " << st_switches
+         << "  final mode: " << (l2_use_irrip ? "I-RRIP" : "RRIP") << endl;
+    cout << "[DYN-IRRIP] prefetch fills: " << st_pf_fills
+         << "  prefetch hits (no promotion): " << st_pf_hits_ignored << endl;
+}

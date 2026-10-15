@@ -1,0 +1,216 @@
+#include "cache.h"
+
+#define IPT_ENTRIES      32
+#define IP_TAG_BITS      12
+#define LINE_BITS        16
+#define STRIDE_BITS      7
+#define SIG_BITS         10
+#define SIG_SHIFT        3
+#define MAX_STRIDE       ((1 << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE)) - 1)
+#define CONF_MAX         3
+#define UNIFORM_CONF     2
+#define PT_CONF          2
+
+#define THROTTLE_WINDOW  256
+#define MIN_DEGREE       1
+#define MAX_DEGREE       6
+#define INIT_DEGREE      3
+#define ACC_HIGH         75
+#define ACC_MID          50
+#define ACC_LOW          25
+
+#define SIG_MASK  ((1 << SIG_BITS) - 1)
+#define LINE_MASK ((1 << LINE_BITS) - 1)
+#define IP_MASK   ((1 << IP_TAG_BITS) - 1)
+
+struct IPT_ENTRY {
+    bool     valid;
+    uint16_t ip_tag;
+    uint16_t last_line;
+    int8_t   stride;
+    uint8_t  conf;
+    uint16_t sig;
+    uint8_t  lru;
+};
+
+struct PT_ENTRY {
+    int8_t  stride;
+    uint8_t conf;
+};
+
+static IPT_ENTRY ipt[IPT_ENTRIES];
+static PT_ENTRY  pt[1 << SIG_BITS];
+
+static int      spp_degree = INIT_DEGREE;
+static uint64_t last_useful = 0, last_useless = 0;
+static uint64_t st_uniform_pf = 0, st_pattern_pf = 0, st_degree_sum = 0, st_decisions = 0;
+static uint64_t st_degree_hist[MAX_DEGREE + 1];
+
+static inline uint16_t ip_hash(uint64_t ip)
+{
+    return (ip ^ (ip >> IP_TAG_BITS) ^ (ip >> (2 * IP_TAG_BITS))) & IP_MASK;
+}
+
+static inline uint16_t sig_next(uint16_t sig, int stride)
+{
+    return ((sig << SIG_SHIFT) ^ (stride & ((1 << STRIDE_BITS) - 1))) & SIG_MASK;
+}
+
+static void ipt_touch(int idx)
+{
+    for (int i = 0; i < IPT_ENTRIES; i++)
+        if (ipt[i].lru < ipt[idx].lru)
+            ipt[i].lru++;
+    ipt[idx].lru = 0;
+}
+
+static void pt_train(uint16_t sig, int stride)
+{
+    PT_ENTRY &e = pt[sig];
+    if (e.stride == stride) {
+        if (e.conf < CONF_MAX) e.conf++;
+    } else if (e.conf > 0) {
+        e.conf--;
+    } else {
+        e.stride = stride;
+        e.conf = 1;
+    }
+}
+
+void spp_throttle(uint64_t useful, uint64_t useless)
+{
+    if (useful < last_useful || useless < last_useless) {
+        last_useful = useful;
+        last_useless = useless;
+    }
+    uint64_t du = useful - last_useful, dl = useless - last_useless;
+    if (du + dl < THROTTLE_WINDOW)
+        return;
+
+    uint64_t acc = du * 100 / (du + dl);
+    if      (acc >= ACC_HIGH) spp_degree = MAX_DEGREE;
+    else if (acc >= ACC_MID)  spp_degree = 4;
+    else if (acc >= ACC_LOW)  spp_degree = 2;
+    else                      spp_degree = MIN_DEGREE;
+
+    last_useful = useful;
+    last_useless = useless;
+    st_decisions++;
+    st_degree_sum += spp_degree;
+    st_degree_hist[spp_degree]++;
+}
+
+void CACHE::l1d_prefetcher_initialize()
+{
+    cout << "CPU " << cpu << " L1D Stride Pattern Prefetcher (SPP): IPT=" << IPT_ENTRIES
+         << " PT=" << (1 << SIG_BITS) << " degree " << MIN_DEGREE << "-" << MAX_DEGREE
+         << " (init " << INIT_DEGREE << ")" << endl;
+    for (int i = 0; i < IPT_ENTRIES; i++) {
+        ipt[i].valid = false;
+        ipt[i].lru = i;
+    }
+    for (int i = 0; i < (1 << SIG_BITS); i++) {
+        pt[i].stride = 0;
+        pt[i].conf = 0;
+    }
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    if (type == PREFETCH)
+        return;
+
+    spp_throttle(pf_useful, pf_useless);
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint16_t line = cl_addr & LINE_MASK;
+    uint16_t tag = ip_hash(ip);
+
+    int idx = -1;
+    for (int i = 0; i < IPT_ENTRIES; i++)
+        if (ipt[i].valid && ipt[i].ip_tag == tag) { idx = i; break; }
+
+    if (idx < 0) {
+        for (int i = 0; i < IPT_ENTRIES; i++)
+            if (ipt[i].lru == IPT_ENTRIES - 1) { idx = i; break; }
+        IPT_ENTRY &n = ipt[idx];
+        n.valid = true;
+        n.ip_tag = tag;
+        n.last_line = line;
+        n.stride = 0;
+        n.conf = 0;
+        n.sig = 0;
+        ipt_touch(idx);
+        return;
+    }
+
+    IPT_ENTRY &t = ipt[idx];
+    ipt_touch(idx);
+
+    int stride = (int16_t)(line - t.last_line);
+    if (stride == 0)
+        return;
+    t.last_line = line;
+
+    if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
+        t.conf = 0;
+        t.sig = 0;
+        return;
+    }
+
+    if (stride == t.stride) {
+        if (t.conf < CONF_MAX) t.conf++;
+    } else {
+        if (t.conf > 0) t.conf--;
+        if (t.conf == 0) t.stride = stride;
+    }
+    pt_train(t.sig, stride);
+    t.sig = sig_next(t.sig, stride);
+
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+    uint64_t pf_cl = cl_addr;
+    bool uniform = (t.conf >= UNIFORM_CONF) && (stride == t.stride);
+    uint16_t sig = t.sig;
+
+    for (int i = 0; i < spp_degree; i++) {
+        int next;
+        if (uniform) {
+            next = t.stride;
+        } else {
+            PT_ENTRY &e = pt[sig];
+            if (e.conf < PT_CONF || e.stride == 0)
+                break;
+            next = e.stride;
+            sig = sig_next(sig, next);
+        }
+        pf_cl += next;
+        uint64_t pf_address = pf_cl << LOG2_BLOCK_SIZE;
+
+        if ((pf_address >> LOG2_PAGE_SIZE) != page)
+            break;
+
+        int fill = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;
+        if (prefetch_line(ip, addr, pf_address, fill, 0)) {
+            if (uniform) st_uniform_pf++;
+            else         st_pattern_pf++;
+        }
+    }
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    return;
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L1D SPP final stats" << endl;
+    cout << "SPP uniform-stride prefetches: " << st_uniform_pf
+         << "  pattern-table prefetches: " << st_pattern_pf << endl;
+    cout << "SPP throttle decisions: " << st_decisions << "  average degree: "
+         << (st_decisions ? (double)st_degree_sum / st_decisions : (double)spp_degree) << endl;
+    cout << "SPP degree histogram:";
+    for (int d = MIN_DEGREE; d <= MAX_DEGREE; d++)
+        cout << " d" << d << "=" << st_degree_hist[d];
+    cout << endl;
+}
